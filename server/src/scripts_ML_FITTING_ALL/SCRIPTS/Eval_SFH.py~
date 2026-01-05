@@ -1,0 +1,445 @@
+# This script will be used to allow the Emulator to make SFH predictions
+
+# Imports
+import numpy as np
+import pandas as pd
+import torch
+import h5py
+import pickle
+import deepdish as dd
+import datetime
+import sys
+import os
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
+from scipy import linalg
+from scipy.ndimage import median_filter, gaussian_filter1d
+
+# Torch Imports
+import torch
+import torch.nn as nn
+import torchbnn as bnn
+import torch.nn.init as init
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.nn.functional as F
+from torch.multiprocessing import Pool, Process, set_start_method
+import torch.multiprocessing as tmp
+
+############################################ CLASS WHICH INSTANTIATE OUR BAYESIAN NEURAL NETWORK ###################################################
+# FOR JZ
+class BayesLinear_JZ(bnn.BayesLinear):
+
+    def __init__(self, prior_mu, prior_sigma, in_features, out_features, bias=True):
+        super(BayesLinear_JZ, self).__init__(prior_mu, prior_sigma, in_features, out_features, bias)
+
+    def forward(self, input):
+        return F.linear(input, self.weight_mu, self.bias_mu)
+
+
+# Our BNN class
+class BayesianNN(nn.Module):
+    # Define Constructor including BNN architecture
+    def __init__(self, input_size, output_size, hidden_sizes, dropout_rate, mu, sig, activation, weight_init_name, bnn_active=False, emulator=None):
+        super(BayesianNN, self).__init__()
+        layers = []
+        in_features = input_size  # Start with the input size
+        #print(input_size, output_size)
+
+        if bnn_active:
+           BayesLinear = bnn.BayesLinear
+        else:
+           BayesLinear = BayesLinear_JZ
+
+        #print(activation)
+           
+        # Create hidden Bayesian layers
+        for i, hidden_size in enumerate(hidden_sizes):
+            layers.append(BayesLinear(prior_mu=mu, prior_sigma=sig, in_features=in_features, out_features=hidden_size, bias=True))
+            layers.append(nn.BatchNorm1d(hidden_size))
+            #layers.append(bnn._BayesBatchNorm(hidden_size))
+            layers.append(activation[i])
+            layers.append(nn.Dropout(dropout_rate[i]))
+            in_features = hidden_size  # Update in_features for the next layer to match current layer's out_features
+
+        # Add the output Bayesian layer
+        layers.append(BayesLinear(prior_mu=mu, prior_sigma=sig, in_features=in_features, out_features=output_size, bias=True))
+
+        # Add sigmoid layer to the end if its a Physical ML we're training to squash outputs to 0 and 1
+        if emulator == 'Physical':
+            layers.append(nn.Sigmoid())
+
+        # Add learnable weights to outputs for Inbox ML as some outputs are harder to predict than others!
+        if emulator == 'Inbox' or emulator == 'SFH':
+            self.param_weight = nn.Parameter(torch.zeros(output_size))
+
+        
+        # Build the model as a sequential container
+        self.model = nn.Sequential(*layers)
+
+        #print(self.model)
+
+        # Apply weight initialization
+        self.__initialize_weights__(weight_init_name)
+
+    
+    ###################################### FOWARD METHODS ###########################################
+    def forward(self, x):
+        return self.model(x)
+
+
+    ###################################### HELPER METHODS ###########################################
+    # Helper Method to initialise BNN weights
+    def __initialize_weights__(self, weight_init_name):
+        for m in self.model:
+            if isinstance(m, bnn.BayesLinear):
+                # Xavier initialization
+                if weight_init_name == 'xavier_uniform':
+                    nn.init.xavier_uniform_(m.weight_mu)  # Initialize weight_mu
+                    if hasattr(m, 'bias_mu') and m.bias_mu is not None:
+                        nn.init.constant_(m.bias_mu, 0)  # Initialize bias_mu to 0
+                elif weight_init_name == 'xavier_normal':
+                    nn.init.xavier_normal_(m.weight_mu)  # Initialize weight_mu
+                    if hasattr(m, 'bias_mu') and m.bias_mu is not None:
+                        nn.init.constant_(m.bias_mu, 0)  # Initialize bias_mu to 0
+            
+                # Kaiming initialization
+                elif weight_init_name == 'kaiming_uniform':
+                    nn.init.kaiming_uniform_(m.weight_mu, nonlinearity='relu')
+                    if hasattr(m, 'bias_mu') and m.bias_mu is not None:
+                        nn.init.constant_(m.bias_mu, 0)
+                elif weight_init_name == 'kaiming_normal':
+                    nn.init.kaiming_normal_(m.weight_mu, nonlinearity='relu')
+                    if hasattr(m, 'bias_mu') and m.bias_mu is not None:
+                        nn.init.constant_(m.bias_mu, 0)
+
+                # Orthogonal initialization
+                elif weight_init_name == 'orthogonal':
+                    nn.init.orthogonal_(m.weight_mu, gain=1.0)  # Gain can be adjusted based on activations
+                    if hasattr(m, 'bias_mu') and m.bias_mu is not None:
+                        nn.init.constant_(m.bias_mu, 0)  # Initialize bias_mu to 0
+
+            # If we're looking at batchnorm layer
+            elif isinstance(m, nn.BatchNorm1d):
+                # BatchNorm1d initialization (same for all methods)
+                nn.init.constant_(m.weight, 1)  # Initialize scale to 1
+                nn.init.constant_(m.bias, 0)    # Initialize shift to 0
+
+# Create BNN architecture for PhysicalGalaxiesEmulator
+'''class PhysicalNN(nn.Module):
+    # Constructor to initialise physical emulator model
+    def __init__(self):
+        super(PhysicalNN, self).__init__()
+        self.model = nn.Sequential(nn.Linear(15, 128),
+                                   nn.GELU(),
+                                   nn.BatchNorm1d(128),
+                                   nn.Linear(128, 32),
+                                   nn.GELU(),
+                                   nn.BatchNorm1d(32),
+                                   #nn.Linear(64, 32),
+                                   #nn.ReLU(),
+                                   #nn.BatchNorm1d(32),
+                                   #nn.LeakyReLU(),
+                                   nn.Linear(32, 1),
+                                   nn.Sigmoid())
+
+    # Forward Method
+    def forward(self, x):
+        return self.model(x) #torch.clip(self.model(x), 0, 1)'''
+
+
+# Create BNN architecture for PhysicalGalaxiesEmulator
+'''class InboxInputNN(nn.Module):
+    # Constructor to initialise physical emulator model
+    def __init__(self):
+        super(InboxInputNN, self).__init__()
+        self.model = nn.Sequential(nn.Linear(15, 128),
+                                   nn.ReLU(),
+                                   nn.BatchNorm1d(128),
+                                   nn.Linear(128, 32),
+                                   nn.GELU(),
+                                   nn.BatchNorm1d(32),
+                                   #nn.Linear(64, 32),
+                                   #nn.ReLU(),
+                                   #nn.BatchNorm1d(32),
+                                   #nn.LeakyReLU(),
+                                   #nn.Linear(64, 32),
+                                   #nn.GELU(),
+                                   #nn.BatchNorm1d(32),
+                                   nn.Linear(32, 15))#,
+                                   #nn.Sigmoid())
+
+    # Forward Method
+    def forward(self, x):
+        return self.model(x) #torch.clip(self.model(x), 0, 1)'''
+
+
+######################## CLASS USED TO EVALUATE OUR EMULATOR ###############################
+class EvalMLSFH:
+    # Define consturctor to initialise global variables and create an instance of our models
+    def __init__(self, library_basename='16par_RANDOM'):
+        # Conditions
+        self.library_basename = library_basename
+
+        # Device
+        self.device = torch.device('cpu')
+        '''try:
+            set_start_method('spawn')
+
+        except RuntimeError:
+            pass'''
+
+        # In features + Read flags
+        self.table_ML_columns = pd.read_hdf('ML_columns.h5', 'ML_columns')
+        flags = self.table_ML_columns['flags'].to_numpy()
+        self.in_features = np.sum(flags)
+
+        # Load Optuna best params for Inbox ML
+        with open(f'../SKIRT_library/{self.library_basename}/out_ML/SE3D_Models/best_optuna/{self.library_basename}_SFH_optuna_best_params.txt', 'r') as f:
+            loaded_data = json.load(f)
+
+        # Extract Optuna best params + NMADs
+        self.best_params_SFH = loaded_data[0]
+
+        # Print
+        #print(f'Using Flux, Size, Sersic, and q models with NMADS: 0.045, 0.033, 0.058, 0.007')
+        
+        # Read in wvl
+        self.wavelength = pd.read_hdf(f'../SKIRT_library/{self.library_basename}/out_SKIRT/DATA/{self.library_basename}_wavelength.h5').to_numpy().flatten()[0]
+
+        # Read norm val file
+        self.norm_input_values = dd.io.load(f'../SKIRT_library/{self.library_basename}/out_ML/SFH_Emulator/all_inbox_inputs.h5')['input_normalisation_params']['normalisation_params']
+
+        # Read norm vals
+        self.norm_output_values = dd.io.load(f'../SKIRT_library/{self.library_basename}/out_ML/SFH_Emulator/SFH_derived_outputs.h5')['output_normalisation_params']['normalisation_params']
+
+    # Public Method to evaluate model
+    def eval_MLSFH(self, SFHmodel, inputs=None):
+        # Set model to eval
+        SFHmodel.eval()
+
+        # Test
+        #if inputs is None:
+        inputs =  pd.read_hdf(f'../SKIRT_library/{library_basename}/out_ML/ML_Inputs/{library_basename}_test_inputs_h5.h5')
+
+        #print(inputs)
+        
+        # Only use inputs necessary
+        # Extract column labels
+        inputs_columns = list(inputs.columns)
+        
+        # Make sure columns + column labels align with order ML wants
+        table_inputs_columns = pd.DataFrame({'columns':inputs_columns})
+        table_inputs_columns = pd.merge(self.table_ML_columns, table_inputs_columns, on='columns', how='inner')
+        inputs_columns = table_inputs_columns[table_inputs_columns['flags']]['columns'].to_numpy().astype(str)
+        all_inputs = inputs.loc[:, inputs_columns]#.to_numpy()
+
+        # List of params used for SFH model
+        sfh_param_list = ['logMstar', 'logMdMs', 'Rstar', 'CsRs', 'nstar', 'RdRs', 'CdRd', 'ndust', 'f_cov', 'Age', 't_peak', 'k_peak', 'fwhm', 'k_fwhm', 'metal']
+        all_inputs = all_inputs.loc[:, sfh_param_list]
+
+        # Normalize
+        all_inputs = self.normalize_inbox_inputs(all_inputs)
+        #print(all_inputs)
+
+        # Tensor it
+        all_inputs = torch.Tensor(all_inputs.to_numpy())
+        
+
+        # Evaluate
+        with torch.no_grad():
+            SFHparams = SFHmodel(all_inputs).detach().numpy()
+
+        #print(SFHparams)
+        print(inputs)
+        print(all_inputs)
+
+        # Denormalise SFH outputs
+        SFHparams = self.denormalize_SFH_outputs(self.__make_df__(inputs=SFHparams, cols=['SFR', 'R_SFR', 'age_w', 'k_age']))
+
+        #print(SFHparams)
+
+        return SFHparams # SFR, R_SFR, age_w, k_age
+
+    # Public Method to return SFH model
+    def load_SFH_model(self):
+        # SFH ML
+        SFH_activation = [self.__get_activation__(self.best_params_SFH[f'activation_{i}']) for i in range(self.best_params_SFH['hidden_layers'])]
+        SFH_nodes = self.__get_nodes__(self.best_params_SFH)
+        SFHdrop = [self.best_params_SFH[f'dropout_rate_{i}'] for i in range(self.best_params_SFH['hidden_layers'])]
+        
+        # SFH ML
+        SFHmodel = BayesianNN(15, 4, SFH_nodes, SFHdrop, self.best_params_SFH['mu'], self.best_params_SFH['sig'], SFH_activation, self.best_params_SFH['weight_init_name'], emulator='SFH')
+
+        # Load checkpoint for Inbox To Input Emulator
+        checkpoint_SFHNN = torch.load(f'../SKIRT_library/{self.library_basename}/out_ML/SE3D_Models/best_models/SFH.pt', weights_only=True)
+        SFHmodel.load_state_dict(checkpoint_SFHNN['model_state_dict'])
+
+        return SFHmodel
+
+    # Public Method to normalize inbox inputs
+    # Public Method to normalise parameters
+    def normalize_inbox_inputs(self, inputs):
+        # Log inputs first!
+        columns_to_log = ['Rstar', 'CsRs', 'nstar', 'RdRs', 'CdRd', 'ndust', 'Age', 't_peak', 'fwhm', 'metal']
+
+        # Ensure all columns to log exist in the DataFrame
+        #missing_columns = [col for col in columns_to_log if col not in inputs.columns]
+        #if missing_columns:
+        #    raise ValueError(f"Missing columns for log transformation: {missing_columns}")
+
+        # Confirm which columns are actually in df
+        columns_to_log = [col for col in columns_to_log if col in inputs.columns]
+        #inputs.loc[:, columns_to_log] = np.log10(inputs.loc[:, columns_to_log])
+        
+        # Log-transform the specified columns
+        #for column in columns_to_log:
+        #    inputs[column] = np.log10(inputs[column]) #.replace(0, np.nan))
+
+        # Empty dict
+        normalized_params = {}
+        #print(np.shape(inputs))
+
+        # Dict shape
+        #normalized_params = np.copy(params)
+        Ngal, Nparams = np.shape(inputs)
+        normalized_params = pd.DataFrame(data=np.zeros([Ngal, Nparams]), columns=inputs.keys())
+
+        # Iterate through and normalise
+        for key in inputs.keys():
+            #print(key)
+            if key in self.norm_input_values:
+                # Read mean, std
+                mean = self.norm_input_values[key]['mean']
+                std = self.norm_input_values[key]['std']
+
+                # New arr
+                values = inputs[key].to_numpy(dtype=np.float32)
+
+                # Log
+                if key in columns_to_log:
+                    values = np.log10(values)
+                    
+                # Normalise
+                normalized_params[key] = (values - mean) / std
+                #print(normalized_params)
+                #print(stop)
+            else:
+                print(f"Normalization parameters for '{key}' are not provided.")
+
+        #print(normalized_params)
+        #print(stop)
+        return normalized_params
+
+    # Public Method to denormalize SFH outputs
+    # Public Method to normalise Physical parameters ## FOR PHYSICAL/UNPHYSICAL EMULATOR
+    def denormalize_SFH_outputs(self, inputs):
+        # Empty dict
+        denormalized_params = {}
+
+        #print(norm_input_physical_values)
+        #print(inputs.keys())
+        #print(stop)
+        #print(np.shape(inputs))
+
+        # Dict shape
+        #normalized_params = np.copy(params)
+        Ngal, Nparams = np.shape(inputs)
+        denormalized_params = pd.DataFrame(data=np.zeros([Ngal, Nparams], dtype=np.float32), columns=inputs.keys())
+
+        #print(self.norm_input_values)
+
+        # Iterate through and denormalise
+        for key in inputs.keys():
+            #print(key)
+            if key in self.norm_output_values:
+                # Read mean, std
+                mean = self.norm_output_values[key]['mean']
+                std = self.norm_output_values[key]['std']
+
+                # New arr
+                values = inputs[key].to_numpy(dtype=np.float32) 
+                #print('key', mean, std)
+                denormalized_params[key] = (values * std) + mean
+            else:
+                raise KeyError(f"Normalization parameters for '{key}' are not provided.")
+
+        # Unlog!
+        # Log everything apart from params that cross 0!
+        params_to_unlog = ['SFR', 'R_SFR']
+        denormalized_params.loc[:, params_to_unlog] = 10**(denormalized_params.loc[:, params_to_unlog])
+ 
+        return denormalized_params
+
+    # Helper Method to get Activation Function
+    def __get_activation__(self, activation_name):
+        # Dictionary of current activation functions
+        activations = {"relu": nn.ReLU(), "tanh": nn.Tanh(), "sigmoid": nn.Sigmoid(), "leaky_relu":nn.LeakyReLU(), "gelu": nn.GELU(), "gelu_tanh": nn.GELU(approximate='tanh'), "silu": nn.SiLU(), "celu": nn.CELU()}
+        
+        return activations[activation_name]
+
+    # Helper Method to get Optimizer
+    def __get_optimizer__(self, model, optimizer_name, weight_decay, lr, beta1, beta2, mom):
+        # Adam
+        if optimizer_name == 'Adam':
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(beta1, beta2))
+            
+        # AdamW
+        if optimizer_name == 'AdamW':
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(beta1, beta2))
+
+        # SGD
+        if optimizer_name == 'SGD':
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=mom)
+
+        # RMSprop
+        if optimizer_name == 'RMSProp':
+            optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, momentum=mom)
+
+        # NAdam
+        if optimizer_name == 'NAdam':
+            optimizer = torch.optim.NAdam(model.parameters(), lr=lr, betas=(beta1, beta2))
+
+        return optimizer
+
+    # Helper Method to get number of nodes in each layer
+    def __get_nodes__(self, data):
+        hidden_layers = data.get('hidden_layers', 0)
+        
+        # Initialize a list to store the n_units values
+        n_units_values = []
+        
+        # Extract n_units values for each layer
+        for layer in range(hidden_layers):
+            key = f'n_units_l{layer}'
+            if key in data:
+                n_units_values.append(data[key])
+
+        # Display the extracted values
+        #print(n_units_values)
+        
+        return n_units_values
+
+    # Helper Method to make inputs go into a df with columns
+    def __make_df__(self, inputs, cols):
+        # Make a df
+        df = pd.DataFrame(inputs, columns=cols)
+
+        return df
+
+
+# Execute
+if __name__ == "__main__":
+    # Library basename
+    library_basename = '16par_RANDOM'
+
+    # Instance of class
+    SFHEval = EvalMLSFH(library_basename=library_basename)
+
+    # Get SFH model
+    SFHmodel = SFHEval.load_SFH_model()
+
+    # Eval
+    SFHparams = SFHEval.eval_MLSFH(SFHmodel=SFHmodel, inputs=None)
+    print(SFHparams)

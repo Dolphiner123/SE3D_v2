@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: my-backend
+    env: python
+    plan: free
+    buildCommand: |
+      curl -sSLo miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+      bash miniconda.sh -b -p $HOME/miniconda
+      export PATH="$HOME/miniconda/bin:$PATH"
+      conda env create -f se3d_PYPC.yml || conda env update -f se3d_PYPC.yml
+
+    startCommand: |
+      export PATH="$HOME/miniconda/bin:$PATH"
+      source activate se3d
+      python src/index.py
